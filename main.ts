@@ -68,7 +68,7 @@ class Tree {
 
 type Edit = (tree: Tree) => void;
 
-/** One Doc from a format module, as an edit over the tree. */
+/** A single document originating from a format plugin, represented as a change applied to the hierarchy. */
 function docEdit(d: Doc): Edit {
   return (tree: Tree) => {
     const p = d.path;
