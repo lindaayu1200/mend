@@ -9,6 +9,10 @@
 
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { parseUnified } from './unified.ts';
+import { parseSrep } from './srep.ts';
+import { parseV4a } from './v4a.ts';
+import type { Doc } from './tiers.ts';
 
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
 
@@ -44,6 +48,7 @@ function safe(p: string): boolean {
 class Tree {
   private readonly orig = new Map<string, string | null>();
   readonly now = new Map<string, string | null>();
+  readonly moves: Array<[string, string]> = [];
   original(p: string): string | null {
     if (!this.orig.has(p)) {
       let v: string | null = null;
@@ -62,6 +67,31 @@ class Tree {
 }
 
 type Edit = (tree: Tree) => void;
+
+/** One Doc from a format module, as an edit over the tree. */
+function docEdit(d: Doc): Edit {
+  return (tree: Tree) => {
+    const p = d.path;
+    if (p === '' || !safe(p)) throw new Fail('unsafe', p);
+    if (d.to !== undefined) {
+      if (!safe(d.to)) throw new Fail('unsafe', d.to);
+      if (tree.get(p) === null) throw new Fail('missing', p);
+      if (tree.get(d.to) !== null) throw new Fail('exists', d.to);
+      const res = d.apply(tree.get(p)!);
+      tree.now.set(d.to, res);
+      tree.now.set(p, null);
+      tree.moves.push([p, d.to]);
+      return;
+    }
+    let res: string | null;
+    try {
+      res = d.apply(tree.get(p));
+    } catch (e) {
+      throw new Fail((e as Error).message, p);
+    }
+    tree.now.set(p, res);
+  };
+}
 
 function detect(lines: string[]): string | null {
   const first = lines.findIndex((l) => !blank(l));
@@ -164,6 +194,11 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
   return edits;
 }
 
+/** Count with a pluralized unit, as the final ok line prints it. */
+function plural(n: number, unit: string): string {
+  return `${n} ${unit}${n === 1 ? '' : 's'}`;
+}
+
 function run(args: string[]): { code: number; out: string[] } {
   let format: string | null = null;
   let check = false;
@@ -192,10 +227,18 @@ function run(args: string[]): { code: number; out: string[] } {
   if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines) : [];
-    if (edits.length === 0) throw new Exit2('error: parse 1');
+    if (kind === 'json') edits = jsonEdits(text, lines);
+    else {
+      const docs =
+        kind === 'unified' ? parseUnified(text, lines, strict) :
+        kind === 'search-replace' ? parseSrep(text, lines, strict) :
+        kind === 'v4a' ? parseV4a(text, lines, strict) : [];
+      if (docs.length === 0) throw new Exit2('error: parse 1');
+      edits = docs.map(docEdit);
+    }
   } catch (e) {
     if (e instanceof Exit2) return { code: 2, out: [e.line] };
+    if (e instanceof Error && /^parse \d+$/.test(e.message)) return { code: 2, out: ['error: ' + e.message] };
     throw e;
   }
   const tree = new Tree();
@@ -212,20 +255,37 @@ function run(args: string[]): { code: number; out: string[] } {
     }
   }
   if (fails.length > 0) return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
-  const rows: string[] = [];
-  for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
-    const was = tree.original(p);
-    const now = tree.now.get(p)!;
-    if (was === now) continue;
-    rows.push(`${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`);
-    if (check) continue;
-    if (now === null) rmSync(p, { force: true });
-    else {
-      mkdirSync(dirname(p), { recursive: true });
-      writeFileSync(p, now);
+  const rows: Array<{ key: string; text: string }> = [];
+  const handled = new Set<string>();
+  for (const [o, n] of tree.moves) {
+    if (tree.original(o) !== null && tree.now.get(o) === null && tree.original(n) === null && tree.now.get(n) !== null) {
+      rows.push({ key: n, text: `R ${o} -> ${n}` });
+      handled.add(o);
+      handled.add(n);
     }
   }
-  return { code: 0, out: [...rows, `ok: ${rows.length} ${rows.length === 1 ? 'file' : 'files'}`] };
+  const keys = [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+  for (const p of keys) {
+    const was = tree.original(p);
+    const now = tree.now.get(p)!;
+    if (was === now || handled.has(p)) continue;
+    rows.push({ key: p, text: `${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}` });
+  }
+  rows.sort((a, b) => Buffer.compare(Buffer.from(a.key), Buffer.from(b.key)));
+  if (!check) {
+    for (const p of keys) {
+      const was = tree.original(p);
+      const now = tree.now.get(p)!;
+      if (was === now) continue;
+      if (now === null) rmSync(p, { force: true });
+      else {
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(p, now);
+      }
+    }
+  }
+  const summary = `ok: ${plural(rows.length, 'file')}`;
+  return { code: 0, out: [...rows.map((r) => r.text), summary] };
 }
 
 
